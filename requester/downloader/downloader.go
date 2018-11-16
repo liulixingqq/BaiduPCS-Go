@@ -5,39 +5,43 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/iikira/BaiduPCS-Go/pcsutil"
+	"github.com/iikira/BaiduPCS-Go/pcsutil/waitgroup"
 	"github.com/iikira/BaiduPCS-Go/pcsverbose"
 	"github.com/iikira/BaiduPCS-Go/requester"
-	"github.com/iikira/BaiduPCS-Go/requester/rio"
 	"io"
+	"net/http"
 	"sync"
 	"time"
 )
 
-//Event 下载任务运行时事件
-type Event func()
+type (
+	// Downloader 下载
+	Downloader struct {
+		onExecuteEvent    requester.Event //开始下载事件
+		onSuccessEvent    requester.Event //成功下载事件
+		onFinishEvent     requester.Event //结束下载事件
+		onPauseEvent      requester.Event //暂停下载事件
+		onResumeEvent     requester.Event //恢复下载事件
+		onCancelEvent     requester.Event //取消下载事件
+		monitorCancelFunc context.CancelFunc
 
-// Downloader 下载
-type Downloader struct {
-	onExecuteEvent    Event //开始下载事件
-	onSuccessEvent    Event //成功下载事件
-	onFinishEvent     Event //结束下载事件
-	onPauseEvent      Event //暂停下载事件
-	onResumeEvent     Event //恢复下载事件
-	onCancelEvent     Event //取消下载事件
-	monitorCancelFunc context.CancelFunc
-
-	executeTime   time.Time
-	executed      bool
-	durl          string
-	writer        rio.WriteCloserAt
-	client        *requester.HTTPClient
-	config        *Config
-	monitor       *Monitor
-	instanceState *InstanceState
-}
+		statusCodeBodyCheckFunc func(respBody io.Reader) error
+		executeTime             time.Time
+		executed                bool
+		durl                    string
+		loadBalansers           []string
+		tryHTTP                 bool
+		writer                  io.WriterAt
+		client                  *requester.HTTPClient
+		config                  *Config
+		monitor                 *Monitor
+		instanceState           *InstanceState
+	}
+)
 
 //NewDownloader 初始化Downloader
-func NewDownloader(durl string, writer rio.WriteCloserAt, config *Config) (der *Downloader) {
+func NewDownloader(durl string, writer io.WriterAt, config *Config) (der *Downloader) {
 	der = &Downloader{
 		durl:   durl,
 		config: config,
@@ -51,12 +55,23 @@ func (der *Downloader) SetClient(client *requester.HTTPClient) {
 	der.client = client
 }
 
+//SetStatusCodeBodyCheckFunc 设置响应状态码出错的检查函数, 当FirstCheckMethod不为HEAD时才有效
+func (der *Downloader) SetStatusCodeBodyCheckFunc(f func(respBody io.Reader) error) {
+	der.statusCodeBodyCheckFunc = f
+}
+
+//TryHTTP 尝试使用 http 连接
+func (der *Downloader) TryHTTP(t bool) {
+	der.tryHTTP = t
+}
+
 func (der *Downloader) lazyInit() {
 	if der.config == nil {
 		der.config = NewConfig()
 	}
 	if der.client == nil {
 		der.client = requester.NewHTTPClient()
+		der.client.SetTimeout(20 * time.Minute)
 	}
 	if der.monitor == nil {
 		der.monitor = NewMonitor()
@@ -68,11 +83,11 @@ func (der *Downloader) Execute() error {
 	der.lazyInit()
 
 	// 检测
-	resp, err := der.client.Req("HEAD", der.durl, nil, nil)
-	if resp != nil {
-		defer resp.Body.Close()
-	}
+	resp, err := der.client.Req("GET", der.durl, nil, nil)
 	if err != nil {
+		if resp != nil {
+			resp.Body.Close()
+		}
 		return err
 	}
 
@@ -80,11 +95,22 @@ func (der *Downloader) Execute() error {
 	switch resp.StatusCode / 100 {
 	case 2: // succeed
 	case 4, 5: // error
+		if der.statusCodeBodyCheckFunc != nil {
+			err = der.statusCodeBodyCheckFunc(resp.Body)
+			resp.Body.Close() // 关闭连接
+			if err != nil {
+				return err
+			}
+		}
 		return errors.New(resp.Status)
 	}
 
+	if resp.ContentLength == 0 {
+		return errors.New("Content-Length is zero")
+	}
+
 	acceptRanges := resp.Header.Get("Accept-Ranges")
-	if resp.ContentLength <= 0 {
+	if resp.ContentLength < 0 {
 		acceptRanges = ""
 	} else {
 		acceptRanges = "bytes"
@@ -94,15 +120,62 @@ func (der *Downloader) Execute() error {
 	status.totalSize = resp.ContentLength
 
 	var (
-		req           = resp.Request
-		durl, referer string
+		loadBalancerResponses = make([]*LoadBalancerResponse, 0, len(der.loadBalansers)+1)
+		handleLoadBalancer    = func(req *http.Request) {
+			if req != nil {
+				if der.tryHTTP {
+					req.URL.Scheme = "http"
+				}
+
+				loadBalancer := &LoadBalancerResponse{
+					URL:     req.URL.String(),
+					Referer: req.Referer(),
+				}
+
+				loadBalancerResponses = append(loadBalancerResponses, loadBalancer)
+				pcsverbose.Verbosef("DEBUG: download task: URL: %s, Referer: %s\n", loadBalancer.URL, loadBalancer.Referer)
+			}
+		}
 	)
 
-	if req != nil {
-		referer = req.Referer()
-		durl = req.URL.String()
-		pcsverbose.Verbosef("DEBUG: download task: URL: %s, Referer: %s\n", durl, referer)
+	handleLoadBalancer(resp.Request) // 加入第一个
+
+	// 负载均衡
+	wg := waitgroup.NewWaitGroup(10)
+	privTimeout := der.client.Client.Timeout
+	der.client.SetTimeout(5 * time.Second)
+	for _, loadBalanser := range der.loadBalansers {
+		wg.AddDelta()
+		go func(loadBalanser string) {
+			defer wg.Done()
+
+			subResp, subErr := der.client.Req("GET", loadBalanser, nil, nil)
+			if subResp != nil {
+				subResp.Body.Close() // 不读Body, 马上关闭连接
+			}
+			if subErr != nil {
+				pcsverbose.Verbosef("DEBUG: loadBalanser Error: %s\n", subErr)
+				return
+			}
+
+			if !ServerEqual(resp, subResp) {
+				pcsverbose.Verbosef("DEBUG: loadBalanser not equal to main server: %s\n", subErr)
+				return
+			}
+
+			if subResp.Request != nil {
+				loadBalancerResponses = append(loadBalancerResponses, &LoadBalancerResponse{
+					URL: subResp.Request.URL.String(),
+				})
+			}
+			handleLoadBalancer(subResp.Request)
+
+		}(loadBalanser)
 	}
+	wg.Wait()
+	der.client.SetTimeout(privTimeout)
+
+	loadBalancerResponseList := NewLoadBalancerResponseList(loadBalancerResponses)
 
 	//load breakpoint
 	err = der.initInstanceState()
@@ -137,6 +210,10 @@ func (der *Downloader) Execute() error {
 		}
 	}
 
+	if der.config.parallel < 1 {
+		der.config.parallel = 1
+	}
+
 	der.config.cacheSize = der.config.CacheSize
 	blockSize := status.totalSize / int64(der.config.parallel)
 
@@ -161,16 +238,20 @@ func (der *Downloader) Execute() error {
 		writerAt = der.writer
 	}
 
-	workerInit := func(wer *Worker) {
-		wer.SetClient(der.client)
-		wer.SetCacheSize(der.config.cacheSize)
-		wer.SetWriteMutex(writeMu)
-		wer.SetReferer(referer)
-	}
-
 	for i := 0; i < der.config.parallel; i++ {
-		worker := NewWorker(int32(i), durl, writerAt)
-		workerInit(worker)
+		loadBalancer := loadBalancerResponseList.SequentialGet()
+		if loadBalancer == nil {
+			continue
+		}
+
+		worker := NewWorker(i, loadBalancer.URL, writerAt)
+		worker.SetClient(der.client)
+		worker.SetCacheSize(der.config.cacheSize)
+		worker.SetWriteMutex(writeMu)
+		worker.SetReferer(loadBalancer.Referer)
+		if i == 0 {
+			worker.firstResp = resp // 使用第一个连接
+		}
 
 		// 分配线程
 		if isRange {
@@ -200,18 +281,18 @@ func (der *Downloader) Execute() error {
 	// 开始执行
 	der.executeTime = time.Now()
 	der.executed = true
-	trigger(der.onExecuteEvent)
+	pcsutil.Trigger(der.onExecuteEvent)
 	der.monitor.Execute(moniterCtx)
 
 	// 检查错误
 	err = der.monitor.Err()
-	if err == nil {
-		trigger(der.onSuccessEvent)
+	if err == nil { // 成功
+		pcsutil.Trigger(der.onSuccessEvent)
+		der.removeInstanceState() // 移除断点续传文件
 	}
 
 	// 执行结束
-	der.removeInstanceState()
-	trigger(der.onFinishEvent)
+	pcsutil.Trigger(der.onFinishEvent)
 	return err
 }
 
@@ -252,7 +333,7 @@ func (der *Downloader) Pause() {
 	if der.monitor == nil {
 		return
 	}
-	trigger(der.onPauseEvent)
+	pcsutil.Trigger(der.onPauseEvent)
 	der.monitor.Pause()
 }
 
@@ -261,7 +342,7 @@ func (der *Downloader) Resume() {
 	if der.monitor == nil {
 		return
 	}
-	trigger(der.onResumeEvent)
+	pcsutil.Trigger(der.onResumeEvent)
 	der.monitor.Resume()
 }
 
@@ -270,8 +351,8 @@ func (der *Downloader) Cancel() {
 	if der.monitor == nil {
 		return
 	}
-	trigger(der.onCancelEvent)
-	trigger(der.monitorCancelFunc)
+	pcsutil.Trigger(der.onCancelEvent)
+	pcsutil.Trigger(der.monitorCancelFunc)
 }
 
 //PrintAllWorkers 输出所有的worker
@@ -283,31 +364,31 @@ func (der *Downloader) PrintAllWorkers() {
 }
 
 //OnExecute 设置开始下载事件
-func (der *Downloader) OnExecute(onExecuteEvent Event) {
+func (der *Downloader) OnExecute(onExecuteEvent requester.Event) {
 	der.onExecuteEvent = onExecuteEvent
 }
 
 //OnSuccess 设置成功下载事件
-func (der *Downloader) OnSuccess(onSuccessEvent Event) {
+func (der *Downloader) OnSuccess(onSuccessEvent requester.Event) {
 	der.onSuccessEvent = onSuccessEvent
 }
 
 //OnFinish 设置结束下载事件
-func (der *Downloader) OnFinish(onFinishEvent Event) {
+func (der *Downloader) OnFinish(onFinishEvent requester.Event) {
 	der.onFinishEvent = onFinishEvent
 }
 
 //OnPause 设置暂停下载事件
-func (der *Downloader) OnPause(onPauseEvent Event) {
+func (der *Downloader) OnPause(onPauseEvent requester.Event) {
 	der.onPauseEvent = onPauseEvent
 }
 
 //OnResume 设置恢复下载事件
-func (der *Downloader) OnResume(onResumeEvent Event) {
+func (der *Downloader) OnResume(onResumeEvent requester.Event) {
 	der.onResumeEvent = onResumeEvent
 }
 
 //OnCancel 设置取消下载事件
-func (der *Downloader) OnCancel(onCancelEvent Event) {
+func (der *Downloader) OnCancel(onCancelEvent requester.Event) {
 	der.onCancelEvent = onCancelEvent
 }

@@ -2,34 +2,27 @@
 package getip
 
 import (
-	"github.com/iikira/BaiduPCS-Go/pcsverbose"
 	"github.com/iikira/BaiduPCS-Go/requester"
-	"regexp"
 	"unsafe"
 )
 
-const (
-	//StrUnknown unknown
-	StrUnknown = "unknown"
-)
+// IPInfoByClient 给定client获取ip地址
+func IPInfoByClient(c *requester.HTTPClient) (ipAddr string, err error) {
+	if c == nil {
+		c = requester.NewHTTPClient()
+	}
 
-var (
-	ipExp = regexp.MustCompile("{ip:'(.*?)',address:'(.*?)'}")
-)
+	body, err := c.Fetch("GET", "https://api.ipify.org", nil, nil)
+	if err != nil {
+		return "", err
+	}
+
+	return *(*string)(unsafe.Pointer(&body)), nil
+}
 
 //IPInfo 获取IP地址和IP位置
-func IPInfo() (ipAddr, location string) {
-	body, err := requester.Fetch("GET", "http://ip.chinaz.com/getip.aspx", nil, nil)
-	if err != nil {
-		pcsverbose.Verbosef("DEBUG: getip: %s\n", err)
-		return StrUnknown, StrUnknown
-	}
-
-	raw := ipExp.FindSubmatch(body)
-	if len(raw) < 3 {
-		pcsverbose.Verboseln("DEBUG: getip: regexp match failed")
-		return StrUnknown, StrUnknown
-	}
-
-	return *(*string)(unsafe.Pointer(&raw[1])), *(*string)(unsafe.Pointer(&raw[2]))
+func IPInfo(https bool) (ipAddr string, err error) {
+	c := requester.NewHTTPClient()
+	c.SetHTTPSecure(https)
+	return IPInfoByClient(c)
 }
